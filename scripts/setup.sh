@@ -40,8 +40,13 @@ check_driver() {
   command -v nvidia-smi >/dev/null || die "nvidia-smi not found; needs an NVIDIA driver"
   nvidia-smi --query-gpu=index,name,memory.used,memory.total --format=csv
   local driver_cuda
-  driver_cuda="$(nvidia-smi | grep -o 'CUDA Version: [0-9.]*' | awk '{print $3}')"
-  [[ -n "${driver_cuda}" ]] || die "could not read the driver CUDA version"
+  driver_cuda="$(nvidia-smi | grep -o 'CUDA Version: *[0-9][0-9.]*' | grep -o '[0-9][0-9.]*$' || true)"
+  if [[ -z "${driver_cuda}" ]]; then
+    # Some drivers print no CUDA version (or N/A) in the nvidia-smi header; the
+    # torch check after the install then decides whether the GPU is usable.
+    echo "note: nvidia-smi reports no CUDA version; the torch check below decides"
+    return
+  fi
   echo "driver supports CUDA ${driver_cuda}, building for CUDA ${WANT_CUDA}"
   local lowest
   lowest="$(printf '%s\n%s\n' "${WANT_CUDA}" "${driver_cuda}" | sort -V | head -n1)"
