@@ -6,9 +6,11 @@
 #   bash scripts/setup.sh download   renderer checkpoint + Wan 2.2 VAE, fills .env
 #   bash scripts/setup.sh all        setup, then download
 #
-# Overrides (environment): WEIGHTS (default <repo>/weights), PYTHON_VERSION
-# (3.11), CUDA_TAG (cu132 = CUDA 13.2), TORCH_SPEC (the torch and torchvision
-# pins; they must exist on that CUDA index).
+# Uses Python's built-in venv and pip; uv is not needed.
+#
+# Overrides (environment): WEIGHTS (default <repo>/weights), PYTHON_BIN (python3;
+# 3.11 or newer), CUDA_TAG (cu132 = CUDA 13.2), TORCH_SPEC (the torch and
+# torchvision pins; they must exist on that CUDA index).
 # Opt-in extras (set to 1): WITH_BASE downloads Cosmos3-Nano too (16B, training
 # only), WITH_DATA installs torchcodec, WITH_TE installs transformer-engine
 # (compiled against the CUDA toolkit on the host), WITH_WANDB installs wandb.
@@ -19,7 +21,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 ROOT="$(pwd)"
 
 WEIGHTS="${WEIGHTS:-${ROOT}/weights}"
-PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 CUDA_TAG="${CUDA_TAG:-cu132}"
 TORCH_SPEC="${TORCH_SPEC:-torch==2.12.0 torchvision==0.27.0}"
 WITH_BASE="${WITH_BASE:-0}"
@@ -73,18 +75,24 @@ PY
 }
 
 cmd_setup() {
-  command -v uv >/dev/null || die "uv not found on PATH"
+  command -v "${PYTHON_BIN}" >/dev/null || die "${PYTHON_BIN} not found on PATH"
+  "${PYTHON_BIN}" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else f"Python 3.11 or newer is needed, found {sys.version.split()[0]}")' \
+    || die "set PYTHON_BIN to a Python 3.11 or newer interpreter"
   check_driver
 
-  # uv venv wipes an existing environment, so only create it when missing.
-  [[ -d .venv ]] || uv venv --python "${PYTHON_VERSION}" .venv
+  # An existing .venv is reused, never recreated.
+  if [[ ! -d .venv ]]; then
+    "${PYTHON_BIN}" -m venv .venv \
+      || die "could not create .venv; on Debian or Ubuntu install the python3-venv package"
+  fi
   # shellcheck disable=SC1091
   source .venv/bin/activate
+  python -m pip install --upgrade pip
 
   echo "--- CUDA torch from the ${CUDA_TAG} index: ${TORCH_SPEC} ---"
   # TORCH_SPEC is split into separate requirements on purpose.
   # shellcheck disable=SC2086
-  uv pip install ${TORCH_SPEC} --index-url "https://download.pytorch.org/whl/${CUDA_TAG}" \
+  python -m pip install ${TORCH_SPEC} --index-url "https://download.pytorch.org/whl/${CUDA_TAG}" \
     || die "no torch build on ${CUDA_TAG} for: ${TORCH_SPEC} (set CUDA_TAG or TORCH_SPEC)"
   check_torch
 
@@ -93,8 +101,8 @@ cmd_setup() {
   [[ "${WITH_TE}" == 1 ]] && extras="${extras},te"
   [[ "${WITH_WANDB}" == 1 ]] && extras="${extras},wandb"
   echo "--- wm with extras: ${extras} ---"
-  uv pip install huggingface_hub "transformers>=4.57"
-  uv pip install -e ".[${extras}]"
+  python -m pip install huggingface_hub "transformers>=4.57"
+  python -m pip install -e ".[${extras}]"
   # The package install must not have replaced the CUDA torch with another build.
   check_torch
   [[ -f .env ]] || cp .env.example .env
