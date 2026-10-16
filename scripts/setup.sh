@@ -80,20 +80,28 @@ cmd_setup() {
     || die "set PYTHON_BIN to a Python 3.11 or newer interpreter"
   check_driver
 
-  # An existing .venv is reused, never recreated.
-  if [[ ! -d .venv ]]; then
+  # An existing .venv is reused, never recreated or deleted.
+  if [[ ! -x .venv/bin/python ]]; then
+    [[ ! -e .venv ]] || die ".venv exists but has no python; remove it yourself and rerun"
     "${PYTHON_BIN}" -m venv .venv \
       || die "could not create .venv; on Debian or Ubuntu install the python3-venv package"
   fi
   # shellcheck disable=SC1091
   source .venv/bin/activate
+  # A venv made by uv, or by a Python without ensurepip, has no pip; ensurepip adds it
+  # to the existing environment.
+  if ! python -m pip --version >/dev/null 2>&1; then
+    echo "--- .venv has no pip; adding it with ensurepip ---"
+    python -m ensurepip --upgrade \
+      || die ".venv has no pip and ensurepip is unavailable; install python3-venv, or run: curl -sS https://bootstrap.pypa.io/get-pip.py | ${ROOT}/.venv/bin/python"
+  fi
   python -m pip install --upgrade pip
 
   echo "--- CUDA torch from the ${CUDA_TAG} index: ${TORCH_SPEC} ---"
   # TORCH_SPEC is split into separate requirements on purpose.
   # shellcheck disable=SC2086
   python -m pip install ${TORCH_SPEC} --index-url "https://download.pytorch.org/whl/${CUDA_TAG}" \
-    || die "no torch build on ${CUDA_TAG} for: ${TORCH_SPEC} (set CUDA_TAG or TORCH_SPEC)"
+    || die "the torch install failed, see the pip output above (a 'no matching distribution' error means ${CUDA_TAG} has no ${TORCH_SPEC}: set CUDA_TAG or TORCH_SPEC)"
   check_torch
 
   local extras=media
