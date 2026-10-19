@@ -44,6 +44,43 @@ def load_dotenv(path: Path) -> None:
             os.environ[key] = value
 
 
+CAR_TINTS = {
+    "red": (1.0, 0.10, 0.08),
+    "blue": (0.10, 0.25, 1.0),
+    "yellow": (1.0, 0.85, 0.10),
+    "green": (0.10, 0.80, 0.20),
+}
+
+
+def recolor_car(frame: torch.Tensor, normal_frame: torch.Tensor, tint: tuple[float, float, float]) -> torch.Tensor:
+    """Tint the car body in the anchor frame. frame/normal_frame: [1,3,H,W] uint8 (RGB / normal-map video frame 0).
+
+    The car is the box that stands out from the road in the normal map, found in the lower centre of the image;
+    only its bright body pixels are tinted (luminance kept, so shading and reflections survive), which leaves
+    windows, shadows and the asphalt inside the box alone. The region and thresholds are tuned for the
+    behind-the-car chase view of this take.
+    """
+    rgb = frame[0].float()
+    normal = normal_frame[0].float()
+    _, h, w = rgb.shape
+    road = normal[:, int(h * 0.85):, : int(w * 0.25)].reshape(3, -1).median(dim=1).values
+    standout = (normal - road[:, None, None]).norm(dim=0) > 40
+    region = torch.zeros_like(standout)
+    region[int(h * 0.45): int(h * 0.97), int(w * 0.30): int(w * 0.80)] = True
+    mask = region & standout
+    columns = (mask.sum(0) > 0.35 * mask.sum(0).max()).nonzero().flatten()
+    rows = (mask.sum(1) > 0.35 * mask.sum(1).max()).nonzero().flatten()
+    trim = int(0.075 * (columns.max() - columns.min()))
+    box = torch.zeros_like(mask)
+    box[rows.min(): rows.max() + 1, columns.min() + trim: columns.max() + 1 - trim] = True
+    box &= mask
+    luminance = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
+    body = box & (luminance > 0.55 * torch.quantile(luminance[box], 0.7))
+    alpha = torch.nn.functional.avg_pool2d(body[None, None].float(), 5, stride=1, padding=2)[0]
+    tinted = (luminance[None] * torch.tensor(tint, device=rgb.device)[:, None, None] * 1.15).clamp(0, 255)
+    return (rgb * (1 - alpha) + tinted * alpha).round().to(torch.uint8)[None]
+
+
 def read_video_ffmpeg(path: Path, width: int, height: int, frames: int) -> torch.Tensor:
     out = subprocess.run(
         [
@@ -58,10 +95,12 @@ def read_video_ffmpeg(path: Path, width: int, height: int, frames: int) -> torch
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--data", required=True, type=Path, help="dir with photoreal.mp4, normal.mp4, depth.npy")
+    parser.add_argument("--data", required=True, type=Path, help="dir with normal.mp4, depth.npy, depth_meta.json (and photoreal.mp4 unless --anchor is given)")
+    parser.add_argument("--anchor", type=Path, default=None, help="first-frame image (or video, first frame used); defaults to <data>/photoreal.mp4")
     parser.add_argument("--checkpoint", type=Path, default=Path("weights/AgentGarten-renderer"))
     parser.add_argument("--wan22-vae", type=Path, default=None, help="defaults to $WM_WAN22_VAE")
     parser.add_argument("--caption", default="A car drives through a low-poly city street at dusk, flat-shaded buildings and road markings visible.")
+    parser.add_argument("--car-color", choices=sorted(CAR_TINTS), default=None, help="recolor the car in the anchor frame and add the color to the caption")
     parser.add_argument("--frames", type=int, default=33, help="pixel frames; must be 1+4*block_frames*n_blocks")
     parser.add_argument("--block-frames", type=int, default=4)
     parser.add_argument("--out", required=True, type=Path)
@@ -98,9 +137,17 @@ def main() -> None:
     width, height = meta["width"], meta["height"]
     source_fps = meta["fps"]
 
-    print(f"reading first {args.frames} frames at {width}x{height}, {source_fps} fps...")
-    video = read_video_ffmpeg(args.data / "photoreal.mp4", width, height, args.frames)
-    normal_rgb = read_video_ffmpeg(args.data / "normal.mp4", width, height, args.frames).float()
+    print(f"reading {args.frames} frames of depth/normal at {width}x{height}, {source_fps} fps...")
+    # Only the first latent frame (the anchor) comes from the RGB side, and the causal VAE
+    # encodes it from pixel frame 0 alone, so one image is enough; repeat it to the clip length
+    # so the video latent has the same shape as the depth/normal latents.
+    anchor_source = args.anchor if args.anchor is not None else args.data / "photoreal.mp4"
+    first_frame = read_video_ffmpeg(anchor_source, width, height, 1)
+    normal_u8 = read_video_ffmpeg(args.data / "normal.mp4", width, height, args.frames)
+    if args.car_color is not None:
+        first_frame = recolor_car(first_frame, normal_u8[:1], CAR_TINTS[args.car_color])
+    video = first_frame.expand(args.frames, -1, -1, -1).contiguous()
+    normal_rgb = normal_u8.float()
     normal = normal_rgb / 127.5 - 1.0
     normal = normal / normal.norm(dim=1, keepdim=True).clamp_min(1e-6)
 
@@ -113,7 +160,7 @@ def main() -> None:
         "video": video.unsqueeze(0).to(device),
         "depth": depth[None, :, None].to(device),
         "normal": normal.unsqueeze(0).to(device),
-        "caption": [args.caption],
+        "caption": [args.caption if args.car_color is None else f"{args.caption} The car is bright {args.car_color}."],
         "fps": torch.tensor([source_fps], device=device),
         "depth_scale": torch.tensor([1.0], device=device),
         "sample_id": [0],
